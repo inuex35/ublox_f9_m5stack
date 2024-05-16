@@ -48,4 +48,4 @@ Multiple WiFi networks and reference stations can be registered. / 複数のWiFi
 
 ## License / ライセンス
 
-This code is released under the MIT License. See the `LICENSE` file for details. / このコードはMITライセンスの下で公開されています。詳細は `LICENS
+This code is released under the MIT License. See the `LICENSE` file for details. / このコードはMITライセンスの下で公開されています。詳細は LICENSE ファイルをご確認ください。
