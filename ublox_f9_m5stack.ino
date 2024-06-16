@@ -321,6 +321,7 @@ void loop() {
       GNSSData[dataCount++] = Serial2.read();
       if (dataCount == sizeof(GNSSData)) break;
     }
+    dataFile = SD.open(fileName, FILE_APPEND);
     if (dataFile) {
       M5.Lcd.printf("Writing %d bytes of GNSS data to file\n", dataCount);
       dataFile.write(GNSSData, dataCount);
@@ -357,7 +358,7 @@ void loop() {
         M5.Lcd.print(nmeaString);
       }
     }
-    
+
     uint16_t rtcmCount = 0;
 
     while (ntrip_c.available()) {
