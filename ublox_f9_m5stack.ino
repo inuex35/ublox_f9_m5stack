@@ -1,7 +1,11 @@
-#include <M5Stack.h>
+#include <M5Core2.h>
 #include <WiFi.h>
 #include <SD.h>
+#include <BluetoothSerial.h>
 #include "NTRIPClient.h"
+#include <SparkFun_u-blox_GNSS_v3.h> //http://librarymanager/All#SparkFun_u-blox_GNSS_v3
+SFE_UBLOX_GNSS_SERIAL myGNSS;
+float heading = 0.0;
 
 NTRIPClient ntrip_c;
 int selectedStationIndex = 0;
@@ -9,7 +13,11 @@ File dataFile;
 const char* ntpServer = "ntp.nict.jp";
 const long gmtOffset_sec = 3600 * 9;
 const int daylightOffset_sec = 0;
-
+BluetoothSerial SerialBT;
+uint8_t GNSSData[1024 * 2];
+uint16_t dataCount = 0;
+uint8_t rtcmData[1024 * 2];
+uint16_t rtcmCount = 0;
 struct ReferenceStation {
   String name;
   String serverAddress;
@@ -73,13 +81,60 @@ bool loadConfigFromSD(WiFiNetwork* wifiNetworks, int& numWiFiNetworks, Reference
   return true;
 }
 
+void displayWiFiList(WiFiNetwork* wifiNetworks, int numWiFiNetworks, int selectedIndex) {
+  M5.Lcd.clear();
+  M5.Lcd.setCursor(0, 0);
+  M5.Lcd.println("Select a WiFi network:");
+  for (int i = 0; i < numWiFiNetworks; i++) {
+    if (i == selectedIndex) {
+      M5.Lcd.print("> ");
+    } else {
+      M5.Lcd.print("  ");
+    }
+    M5.Lcd.println(wifiNetworks[i].ssid);
+  }
+}
+
+void displayStationList(ReferenceStation* referenceStations, int numStations, int selectedIndex) {
+  M5.Lcd.clear();
+  M5.Lcd.setCursor(0, 0);
+  M5.Lcd.println("Select a reference station:");
+
+  for (int i = 0; i < numStations; i++) {
+    if (i == selectedIndex) {
+      M5.Lcd.print("> ");
+    } else {
+      M5.Lcd.print("  ");
+    }
+    M5.Lcd.println(referenceStations[i].name);
+  }
+}
+
+int selectWiFiFromList(WiFiNetwork* wifiNetworks, int numWiFiNetworks) {
+  int selectedIndex = 0;
+  displayWiFiList(wifiNetworks, numWiFiNetworks, selectedIndex);
+
+  while (true) {
+    M5.update();
+
+    if (M5.BtnA.wasPressed()) {
+      selectedIndex = (selectedIndex - 1 + numWiFiNetworks) % numWiFiNetworks;
+      displayWiFiList(wifiNetworks, numWiFiNetworks, selectedIndex);
+    } else if (M5.BtnC.wasPressed()) {
+      selectedIndex = (selectedIndex + 1) % numWiFiNetworks;
+      displayWiFiList(wifiNetworks, numWiFiNetworks, selectedIndex);
+    } else if (M5.BtnB.wasPressed()) {
+      return selectedIndex;
+    }
+    delay(100);
+  }
+}
+
 int selectReferenceStation(ReferenceStation* referenceStations, int numStations) {
   int selectedIndex = 0;
-  bool stationSelected = false;
-
   displayStationList(referenceStations, numStations, selectedIndex);
 
-  while (!stationSelected) {
+  while (true) {
     M5.update();
 
     if (M5.BtnA.wasPressed()) {
@@ -89,25 +144,9 @@ int selectReferenceStation(ReferenceStation* referenceStations, int numStations)
       selectedIndex = (selectedIndex + 1) % numStations;
       displayStationList(referenceStations, numStations, selectedIndex);
     } else if (M5.BtnB.wasPressed()) {
-      stationSelected = true;
+      return selectedIndex;
     }
     delay(100);
-  }
-  return selectedIndex;
-}
-
-void displayStationList(ReferenceStation* referenceStations, int numStations, int selectedIndex) {
-  M5.Lcd.clear();
-  M5.Lcd.setCursor(0, 0);
-  M5.Lcd.println("Select a reference station:");
-
-  for (int i = 0; i < numStations; i++) {
-      if (i == selectedIndex) {
-          M5.Lcd.print("> ");
-      } else {
-          M5.Lcd.print("  ");
-      }
-      M5.Lcd.println(referenceStations[i].name);
   }
 }
 
@@ -131,8 +170,7 @@ void connectToStation(int index, ReferenceStation* referenceStations) {
         ntrip_c.readLine(buffer,sizeof(buffer));
         M5.Lcd.print(buffer);
       }
-    }
-    else{
+    } else {
       M5.Lcd.println("SourceTable request error");
     }
     M5.Lcd.print("Requesting SourceTable is OK\n");
@@ -145,113 +183,48 @@ void connectToStation(int index, ReferenceStation* referenceStations) {
     if (!ntrip_c.reqRaw(host, port, mntpnt, user, psw)) {
       delay(15000);
       ESP.restart();
-    }
-    else {
+    } else {
       M5.Lcd.println("Requesting MountPoint failed");
     }
   }
 }
 
-int selectWiFiFromList(WiFiNetwork* wifiNetworks, int numWiFiNetworks) {
-  M5.Lcd.clear();
-  M5.Lcd.setCursor(0, 0);
-  M5.Lcd.println("Scanning WiFi networks...");
-
-  int selectedIndex = 0;
-  int scrollOffset = 0;
-
-  displayWiFiList(wifiNetworks, numWiFiNetworks, selectedIndex, scrollOffset);
-
-  while (true) {
-    M5.update();
-    if (M5.BtnA.wasPressed()) {
-      if (selectedIndex > 0) {
-        selectedIndex--;
-        if (selectedIndex < scrollOffset) {
-          scrollOffset--;
-        }
-        displayWiFiList(wifiNetworks, numWiFiNetworks, selectedIndex, scrollOffset);
-      }
-    } else if (M5.BtnC.wasPressed()) {
-      if (selectedIndex < numWiFiNetworks - 1) {
-        selectedIndex++;
-        if (selectedIndex >= scrollOffset + 5) {
-          scrollOffset++;
-        }
-        displayWiFiList(wifiNetworks, numWiFiNetworks, selectedIndex, scrollOffset);
-      }
-    } else if (M5.BtnB.wasPressed()) {
-      return selectedIndex;
-    }
-    delay(100);
+String gnths_to_gnhdt(String gnths_message) {
+  int startIndex = gnths_message.indexOf("$GNTHS");
+  if (startIndex == -1) {
+    return ""; // GNTHSメッセージが見つからない場合は空文字を返す
   }
-}
-
-void displayWiFiList(WiFiNetwork* wifiNetworks, int numWiFiNetworks, int selectedIndex, int scrollOffset) {
-  M5.Lcd.clear();
-  M5.Lcd.setCursor(0, 0);
-  M5.Lcd.println("Select a WiFi network:");
-  for (int i = scrollOffset; i < min(numWiFiNetworks, scrollOffset + 5); ++i) {
-    if (i == selectedIndex) {
-      M5.Lcd.print("> ");
-    } else {
-      M5.Lcd.print("  ");
-    }
-    M5.Lcd.println(wifiNetworks[i].ssid);
+  
+  int endIndex = gnths_message.indexOf('*', startIndex);
+  if (endIndex == -1) {
+    return ""; // メッセージの終わりが見つからない場合は空文字を返す
   }
-}
 
-void ntripClientTask(void *pvParameters) {
-  while (true) {
-    uint8_t rtcmData[512 * 2];
-    uint16_t rtcmCount = 0;
-
-    while (ntrip_c.available()) {
-      rtcmData[rtcmCount++] = ntrip_c.read();
-      if (rtcmCount == sizeof(rtcmData)) break;
-    }
-
-    Serial2.write(rtcmData, rtcmCount);
-
-    vTaskDelay(10 / portTICK_PERIOD_MS);
+  String gnths_body = gnths_message.substring(startIndex + 7, endIndex); // $GNTHS, をスキップ
+  int commaIndex = gnths_body.indexOf(',');
+  if (commaIndex == -1) {
+    return ""; // ヘディングとスピードの区切りが見つからない場合は空文字を返す
   }
-}
 
-void gnssDataTask(void *pvParameters) {
-  char* fileName = (char*)pvParameters;
-
-  while (true) {
-    uint8_t GNSSData[1024 * 2];
-    uint16_t dataCount = 0;
-
-    while (Serial2.available()) {
-      GNSSData[dataCount++] = Serial2.read();
-      if (dataCount == sizeof(GNSSData)) break;
-    }
-
-    if (dataCount > 0) {
-      M5.Lcd.printf("Trying to write %d bytes of GNSS data to file\n", dataCount);
-      M5.Lcd.clear();
-      M5.Lcd.setCursor(0, 0);
-      dataFile = SD.open(fileName, FILE_APPEND);
-      if (dataFile) {
-        M5.Lcd.printf("Writing %d bytes of GNSS data to file\n", dataCount);
-        dataFile.write(GNSSData, dataCount);
-        dataFile.close();
-        M5.Lcd.clear();
-        M5.Lcd.setCursor(0, 0);
-      } else {
-        M5.Lcd.println("Failed to open data file for writing");
-        M5.Lcd.clear();
-        M5.Lcd.setCursor(0, 0);
-      }
-    }
-    vTaskDelay(10 / portTICK_PERIOD_MS);
+  String heading = gnths_body.substring(0, commaIndex);
+  String gnhdt_message = "$GNHDT," + heading + ",T";
+  
+  // チェックサムの計算
+  int checksum = 0;
+  for (int i = 1; i < gnhdt_message.length(); ++i) {
+    checksum ^= gnhdt_message[i];
   }
+
+  char checksumStr[3];
+  sprintf(checksumStr, "%02X", checksum);
+  gnhdt_message += "*" + String(checksumStr);
+
+  return "\r\n" + gnhdt_message + "\r\n"; // 改行を追加
 }
 
 void setup() {
   M5.begin();
+  SerialBT.begin("GNSS_BT"); // Bluetooth name
   WiFiNetwork wifiNetworks[10];
   int numWiFiNetworks = 0;
   ReferenceStation referenceStations[10];
@@ -305,7 +278,9 @@ void setup() {
   selectedStationIndex = selectReferenceStation(referenceStations, numStations);
   connectToStation(selectedStationIndex, referenceStations);
 
-  Serial2.begin(230400, SERIAL_8N1, 16, 17);
+  Serial2.begin(230400, SERIAL_8N1, 33, 32);
+  while (!Serial2) //Wait for user to open terminal
+  if (myGNSS.begin(Serial2) == true) break;
 
   M5.Lcd.println("Serial begin.");
   delay(3000);
@@ -333,15 +308,63 @@ void setup() {
   } else {
     M5.Lcd.println("Failed to open data file for writing");
   }
+
+  M5.Lcd.println("Setup complete.");
   delay(3000);
-  M5.Speaker.tone(100, 100);
-  delay(100);
-  M5.Speaker.mute();
-  xTaskCreate(ntripClientTask, "NTRIPClient", 4096, NULL, 1, NULL);
-  xTaskCreate(gnssDataTask, "GNSSData", 8192, (void*)fileName, 1, NULL);
+
 }
 
-void loop()
-{
+void loop() {
+    uint16_t dataCount = 0;
 
+    while (Serial2.available()) {
+      GNSSData[dataCount++] = Serial2.read();
+      if (dataCount == sizeof(GNSSData)) break;
+    }
+    if (dataFile) {
+      M5.Lcd.printf("Writing %d bytes of GNSS data to file\n", dataCount);
+      dataFile.write(GNSSData, dataCount);
+      dataFile.close();
+    }
+    M5.Lcd.clear();
+
+    // Process NMEA Data for Bluetooth and Display
+    String nmeaString = "";
+  
+    if (dataCount > 0) {
+      String nmeaString = "";
+      for (int i = 0; i < dataCount; ++i) {
+        nmeaString += (char)GNSSData[i];
+      }
+
+      if (nmeaString.indexOf("$GNTHS") != -1) {
+        String gnhdtString = gnths_to_gnhdt(nmeaString);
+        if (gnhdtString.length() > 0) {
+          nmeaString = gnhdtString; // GNHDTメッセージに置き換え
+
+          if (SerialBT.hasClient()) { // Bluetoothクライアントが接続されているか確認
+            SerialBT.print(nmeaString);
+          }
+        }
+      }
+
+      if (nmeaString.indexOf("$GNGGA") != -1) {
+        if (SerialBT.hasClient()) { // Bluetoothクライアントが接続されているか確認
+          SerialBT.print(nmeaString);
+        }
+        M5.Lcd.clear();
+        M5.Lcd.setCursor(0, 0);
+        M5.Lcd.print(nmeaString);
+      }
+    }
+    
+    uint16_t rtcmCount = 0;
+
+    while (ntrip_c.available()) {
+      rtcmData[rtcmCount++] = ntrip_c.read();
+      if (rtcmCount == sizeof(rtcmData)) break;
+    }
+    if(rtcmCount>0){
+      Serial2.write(rtcmData, rtcmCount);
+    }
 }
