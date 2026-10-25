@@ -1,6 +1,9 @@
 #include <M5Stack.h>
 #include <WiFi.h>
 #include <SD.h>
+#include <Wire.h>
+#include <WebServer.h>
+#include <freertos/stream_buffer.h>
 #include "NTRIPClient.h"
 
 NTRIPClient ntrip_c;
@@ -12,8 +15,11 @@ const int daylightOffset_sec = 0;
 
 const int MAX_WIFI = 10;
 const int MAX_STATIONS = 10;
-const uint32_t GNSS_BAUD = 230400;
-const size_t GNSS_RX_BUFFER = 16384;           // the default 256 bytes overflow while the SD card is busy
+// Receiver on Qwiic / Grove Port A (I2C, u-blox DDC). The receiver buffers its output and we poll it.
+const uint8_t GNSS_I2C_ADDR = 0x42;
+const int GNSS_SDA = 21, GNSS_SCL = 22;
+const uint32_t GNSS_I2C_HZ = 400000;            // u-blox DDC maximum
+const size_t I2C_CHUNK = 128;                   // Wire buffer size in arduino-esp32
 const uint32_t SD_FLUSH_INTERVAL_MS = 1000;
 const uint32_t GGA_INTERVAL_MS = 10000;
 const uint32_t RECONNECT_INTERVAL_MS = 10000;
@@ -39,6 +45,9 @@ ReferenceStation referenceStations[MAX_STATIONS];
 portMUX_TYPE ggaMux = portMUX_INITIALIZER_UNLOCKED;
 char latestGGA[100] = "";
 volatile uint32_t loggedBytes = 0;
+// RTCM from the NTRIP task to the GNSS task, which owns the I2C bus.
+StreamBufferHandle_t rtcmBuffer;
+WebServer server(80);
 
 bool loadConfigFromSD(WiFiNetwork* wifiNetworks, int& numWiFiNetworks, ReferenceStation* stations, int& numStations) {
   File configFile = SD.open("/config.txt");
@@ -236,7 +245,7 @@ void ntripClientTask(void *pvParameters) {
     int n = ntrip_c.available();
     if (n > 0) {
       n = ntrip_c.read(rtcmData, min(n, (int)sizeof(rtcmData)));
-      if (n > 0) Serial2.write(rtcmData, n);
+      if (n > 0) xStreamBufferSend(rtcmBuffer, rtcmData, n, 0);   // dropped if the GNSS task falls behind
     }
 
     if (lastGGA == 0 || millis() - lastGGA > GGA_INTERVAL_MS) {
@@ -281,14 +290,54 @@ void scanForGGA(const uint8_t* data, int len) {
   }
 }
 
-// Receiver -> SD card. The file stays open; data is flushed once a second.
+// Bytes waiting in the receiver's output buffer (registers 0xFD/0xFE), 0 on error.
+uint16_t gnssAvailable() {
+  Wire.beginTransmission(GNSS_I2C_ADDR);
+  Wire.write(0xFD);
+  if (Wire.endTransmission(false) != 0) return 0;
+  if (Wire.requestFrom(GNSS_I2C_ADDR, (uint8_t)2) != 2) return 0;
+  uint16_t n = (uint16_t)Wire.read() << 8;
+  n |= Wire.read();
+  return n == 0xFFFF ? 0 : n;
+}
+
+// Read up to len bytes of the receiver's data stream (register 0xFF).
+int gnssRead(uint8_t* buf, int len) {
+  int got = 0;
+  while (got < len) {
+    int want = min(len - got, (int)I2C_CHUNK);
+    Wire.beginTransmission(GNSS_I2C_ADDR);
+    Wire.write(0xFF);
+    if (Wire.endTransmission(false) != 0) break;
+    int n = Wire.requestFrom(GNSS_I2C_ADDR, (uint8_t)want);
+    for (int k = 0; k < n; k++) buf[got++] = Wire.read();
+    if (n < want) break;
+  }
+  return got;
+}
+
+// Write RTCM to the receiver. u-blox treats a 1-byte write as a register address, so writes are >= 2 bytes.
+void gnssWrite(const uint8_t* buf, int len) {
+  for (int off = 0; off < len; off += I2C_CHUNK) {
+    Wire.beginTransmission(GNSS_I2C_ADDR);
+    Wire.write(buf + off, min(len - off, (int)I2C_CHUNK));
+    Wire.endTransmission();
+  }
+}
+
+// Receiver <-> I2C: forward RTCM, read its output, log it to the SD card (file kept open, flushed once a second).
 void gnssDataTask(void *pvParameters) {
   static uint8_t GNSSData[4096];
+  static uint8_t rtcm[512];
+  size_t rtcmCarry = 0;             // a lone byte kept back until more RTCM arrives
   uint32_t lastFlush = millis();
   while (true) {
-    int n = Serial2.available();
+    size_t r = xStreamBufferReceive(rtcmBuffer, rtcm + rtcmCarry, sizeof(rtcm) - rtcmCarry, 0) + rtcmCarry;
+    if (r >= 2) { gnssWrite(rtcm, r); rtcmCarry = 0; } else rtcmCarry = r;
+
+    int n = gnssAvailable();
     if (n > 0) {
-      n = Serial2.readBytes(GNSSData, min(n, (int)sizeof(GNSSData)));
+      n = gnssRead(GNSSData, min(n, (int)sizeof(GNSSData)));
       scanForGGA(GNSSData, n);
       if (dataFile) {
         dataFile.write(GNSSData, n);
@@ -301,6 +350,36 @@ void gnssDataTask(void *pvParameters) {
     }
     if (n <= 0) vTaskDelay(5 / portTICK_PERIOD_MS);
   }
+}
+
+// ---- Download over WiFi: http://<M5Stack IP>/ lists the .ubx files on the SD card ----
+void handleIndex() {
+  String html = "<html><head><meta name=viewport content='width=device-width'></head><body><h3>GNSS logs</h3><ul>";
+  File root = SD.open("/");
+  for (File f = root.openNextFile(); f; f = root.openNextFile()) {
+    String name = f.name();
+    if (!f.isDirectory() && name.endsWith(".ubx")) {
+      if (!name.startsWith("/")) name = "/" + name;
+      html += "<li><a href='/dl?f=" + name + "'>" + name.substring(1) + "</a> (" + String((unsigned long)f.size() / 1024) + " KB)";
+      if (name == String(fileName)) html += " <b>recording</b>";
+      html += "</li>";
+    }
+    f.close();
+  }
+  root.close();
+  html += "</ul></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleDownload() {
+  String name = server.arg("f");
+  if (!name.startsWith("/") || name.indexOf("..") >= 0 || !name.endsWith(".ubx")) { server.send(400, "text/plain", "bad name"); return; }
+  if (name == String(fileName) && dataFile) dataFile.flush();     // include everything logged so far
+  File f = SD.open(name, FILE_READ);
+  if (!f) { server.send(404, "text/plain", "not found"); return; }
+  server.sendHeader("Content-Disposition", "attachment; filename=" + name.substring(1));
+  server.streamFile(f, "application/octet-stream");
+  f.close();
 }
 
 void setup() {
@@ -360,10 +439,10 @@ void setup() {
   selectedStationIndex = selectReferenceStation(referenceStations, numStations);
   connectToStation(selectedStationIndex, referenceStations);
 
-  Serial2.setRxBufferSize(GNSS_RX_BUFFER);    // must be set before begin()
-  Serial2.begin(GNSS_BAUD, SERIAL_8N1, 16, 17);
+  Wire.begin(GNSS_SDA, GNSS_SCL, GNSS_I2C_HZ);
+  rtcmBuffer = xStreamBufferCreate(8192, 1);
 
-  M5.Lcd.println("Serial begin.");
+  M5.Lcd.println("I2C begin.");
   delay(3000);
 
   M5.Lcd.clear();
@@ -398,18 +477,23 @@ void setup() {
   M5.Speaker.mute();
   xTaskCreate(ntripClientTask, "NTRIPClient", 6144, NULL, 1, NULL);
   xTaskCreate(gnssDataTask, "GNSSData", 6144, NULL, 2, NULL);
+  server.on("/", handleIndex);
+  server.on("/dl", handleDownload);
+  server.begin();
 }
 
 // Status screen once a second instead of clearing the LCD on every write.
 void loop()
 {
+  server.handleClient();
   static uint32_t last = 0;
   if (millis() - last < 1000) return;
   last = millis();
-  M5.Lcd.fillRect(0, 0, 320, 80, BLACK);
+  M5.Lcd.fillRect(0, 0, 320, 100, BLACK);
   M5.Lcd.setCursor(0, 0);
   M5.Lcd.printf("File: %s\n", fileName);
   M5.Lcd.printf("Logged: %lu bytes\n", (unsigned long)loggedBytes);
   M5.Lcd.printf("NTRIP: %s\n", ntrip_c.connected() ? "connected" : "reconnecting");
   M5.Lcd.printf("GGA: %s\n", latestGGA[0] ? "yes" : "none yet");
+  M5.Lcd.printf("Download: http://%s/\n", WiFi.localIP().toString().c_str());
 }
