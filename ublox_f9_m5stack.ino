@@ -10,6 +10,14 @@ const char* ntpServer = "ntp.nict.jp";
 const long gmtOffset_sec = 3600 * 9;
 const int daylightOffset_sec = 0;
 
+const int MAX_WIFI = 10;
+const int MAX_STATIONS = 10;
+const uint32_t GNSS_BAUD = 230400;
+const size_t GNSS_RX_BUFFER = 16384;           // the default 256 bytes overflow while the SD card is busy
+const uint32_t SD_FLUSH_INTERVAL_MS = 1000;
+const uint32_t GGA_INTERVAL_MS = 10000;
+const uint32_t RECONNECT_INTERVAL_MS = 10000;
+
 struct ReferenceStation {
   String name;
   String serverAddress;
@@ -25,8 +33,14 @@ struct WiFiNetwork {
 };
 
 char fileName[40];
+ReferenceStation referenceStations[MAX_STATIONS];
 
-bool loadConfigFromSD(WiFiNetwork* wifiNetworks, int& numWiFiNetworks, ReferenceStation* referenceStations, int& numStations) {
+// Latest GGA sentence seen in the receiver's output (written by the GNSS task, read by the NTRIP task).
+portMUX_TYPE ggaMux = portMUX_INITIALIZER_UNLOCKED;
+char latestGGA[100] = "";
+volatile uint32_t loggedBytes = 0;
+
+bool loadConfigFromSD(WiFiNetwork* wifiNetworks, int& numWiFiNetworks, ReferenceStation* stations, int& numStations) {
   File configFile = SD.open("/config.txt");
   if (!configFile) {
     M5.Lcd.println("Failed to open config file");
@@ -41,25 +55,29 @@ bool loadConfigFromSD(WiFiNetwork* wifiNetworks, int& numWiFiNetworks, Reference
     line = configFile.readStringUntil('\n');
     line.trim();
 
-    if (line.startsWith("WIFI:")) {
+    if (line.startsWith("WIFI:") && wifiIndex < MAX_WIFI) {
       int delimiterIndex = line.indexOf(',');
       if (delimiterIndex != -1) {
         wifiNetworks[wifiIndex].ssid = line.substring(5, delimiterIndex);
         wifiNetworks[wifiIndex].password = line.substring(delimiterIndex + 1);
         wifiIndex++;
       }
-    } else if (line.startsWith("STATION:")) {
-      int delimiterIndex1 = line.indexOf(',');
-      int delimiterIndex2 = line.indexOf(',', delimiterIndex1 + 1);
-      int delimiterIndex3 = line.indexOf(',', delimiterIndex2 + 1);
-      int delimiterIndex4 = line.indexOf(',', delimiterIndex3 + 1);
+    } else if (line.startsWith("STATION:") && stationIndex < MAX_STATIONS) {
+      // STATION:NAME,SERVER_ADDRESS,PORT,MOUNTPOINT,USERNAME,PASSWORD (username/password may be empty)
+      int d1 = line.indexOf(',');
+      int d2 = line.indexOf(',', d1 + 1);
+      int d3 = line.indexOf(',', d2 + 1);
+      int d4 = line.indexOf(',', d3 + 1);
+      int d5 = line.indexOf(',', d4 + 1);
 
-      if (delimiterIndex1 != -1 && delimiterIndex2 != -1 && delimiterIndex3 != -1 && delimiterIndex4 != -1) {
-        referenceStations[stationIndex].name = line.substring(8, delimiterIndex1);
-        referenceStations[stationIndex].serverAddress = line.substring(delimiterIndex1 + 1, delimiterIndex2);
-        referenceStations[stationIndex].portNumber = line.substring(delimiterIndex2 + 1, delimiterIndex3).toInt();
-        referenceStations[stationIndex].mountPoint = line.substring(delimiterIndex3 + 1, delimiterIndex4);
-        referenceStations[stationIndex].username = line.substring(delimiterIndex4 + 1);
+      if (d1 != -1 && d2 != -1 && d3 != -1) {
+        ReferenceStation& st = stations[stationIndex];
+        st.name = line.substring(8, d1);
+        st.serverAddress = line.substring(d1 + 1, d2);
+        st.portNumber = line.substring(d2 + 1, d3).toInt();
+        st.mountPoint = d4 == -1 ? line.substring(d3 + 1) : line.substring(d3 + 1, d4);
+        st.username = d4 == -1 ? "" : (d5 == -1 ? line.substring(d4 + 1) : line.substring(d4 + 1, d5));
+        st.password = d5 == -1 ? "" : line.substring(d5 + 1);
         stationIndex++;
       }
     }
@@ -73,21 +91,21 @@ bool loadConfigFromSD(WiFiNetwork* wifiNetworks, int& numWiFiNetworks, Reference
   return true;
 }
 
-int selectReferenceStation(ReferenceStation* referenceStations, int numStations) {
+int selectReferenceStation(ReferenceStation* stations, int numStations) {
   int selectedIndex = 0;
   bool stationSelected = false;
 
-  displayStationList(referenceStations, numStations, selectedIndex);
+  displayStationList(stations, numStations, selectedIndex);
 
   while (!stationSelected) {
     M5.update();
 
     if (M5.BtnA.wasPressed()) {
       selectedIndex = (selectedIndex - 1 + numStations) % numStations;
-      displayStationList(referenceStations, numStations, selectedIndex);
+      displayStationList(stations, numStations, selectedIndex);
     } else if (M5.BtnC.wasPressed()) {
       selectedIndex = (selectedIndex + 1) % numStations;
-      displayStationList(referenceStations, numStations, selectedIndex);
+      displayStationList(stations, numStations, selectedIndex);
     } else if (M5.BtnB.wasPressed()) {
       stationSelected = true;
     }
@@ -96,7 +114,7 @@ int selectReferenceStation(ReferenceStation* referenceStations, int numStations)
   return selectedIndex;
 }
 
-void displayStationList(ReferenceStation* referenceStations, int numStations, int selectedIndex) {
+void displayStationList(ReferenceStation* stations, int numStations, int selectedIndex) {
   M5.Lcd.clear();
   M5.Lcd.setCursor(0, 0);
   M5.Lcd.println("Select a reference station:");
@@ -107,48 +125,47 @@ void displayStationList(ReferenceStation* referenceStations, int numStations, in
       } else {
           M5.Lcd.print("  ");
       }
-      M5.Lcd.println(referenceStations[i].name);
+      M5.Lcd.println(stations[i].name);
   }
 }
 
-void connectToStation(int index, ReferenceStation* referenceStations) {
-  const ReferenceStation& station = referenceStations[index];
+// Open the correction stream of the selected mountpoint. Returns false on any failure.
+bool requestStream(const ReferenceStation& station) {
+  return ntrip_c.reqRaw(station.serverAddress.c_str(), station.portNumber, station.mountPoint.c_str(),
+                        station.username.c_str(), station.password.c_str());
+}
+
+void connectToStation(int index, ReferenceStation* stations) {
+  const ReferenceStation& station = stations[index];
 
   M5.Lcd.clear();
   M5.Lcd.setCursor(0, 0);
   M5.Lcd.println("Connecting to:");
   M5.Lcd.println(station.name);
-  char* host = const_cast<char*>(station.serverAddress.c_str());
-  int port = station.portNumber;
-  if (ntrip_c.connect(host, port)) {
-    M5.Lcd.println("Connected to NTRIP server");
 
-    M5.Lcd.println("Requesting SourceTable");
-    if (ntrip_c.reqSrcTbl(host, port)) {
-      char buffer[512];
-      delay(5);
-      while(ntrip_c.available()){
-        ntrip_c.readLine(buffer,sizeof(buffer));
-        M5.Lcd.print(buffer);
-      }
+  M5.Lcd.println("Requesting SourceTable");
+  if (ntrip_c.reqSrcTbl(station.serverAddress.c_str(), station.portNumber)) {
+    char buffer[512];
+    delay(5);
+    while(ntrip_c.available()){
+      ntrip_c.readLine(buffer,sizeof(buffer));
+      M5.Lcd.print(buffer);
     }
-    else{
-      M5.Lcd.println("SourceTable request error");
-    }
-    M5.Lcd.print("Requesting SourceTable is OK\n");
-    ntrip_c.stop();
+    M5.Lcd.println("Requesting SourceTable is OK");
+  }
+  else{
+    M5.Lcd.println("SourceTable request error");
+  }
+  ntrip_c.stop();
 
-    M5.Lcd.println("Requesting MountPoint's Raw data");
-    char* mntpnt = const_cast<char*>(station.mountPoint.c_str());
-    char* user = const_cast<char*>(station.username.c_str());
-    char* psw = const_cast<char*>(station.password.c_str());
-    if (!ntrip_c.reqRaw(host, port, mntpnt, user, psw)) {
-      delay(15000);
-      ESP.restart();
-    }
-    else {
-      M5.Lcd.println("Requesting MountPoint failed");
-    }
+  M5.Lcd.println("Requesting MountPoint's Raw data");
+  if (requestStream(station)) {
+    M5.Lcd.println("Requesting MountPoint is OK");
+  }
+  else {
+    M5.Lcd.println("Requesting MountPoint failed, restarting");
+    delay(15000);
+    ESP.restart();
   }
 }
 
@@ -201,64 +218,103 @@ void displayWiFiList(WiFiNetwork* wifiNetworks, int numWiFiNetworks, int selecte
   }
 }
 
+// Corrections: caster -> receiver. Also uploads GGA periodically and reconnects when the caster drops us.
 void ntripClientTask(void *pvParameters) {
+  uint8_t rtcmData[1024];
+  uint32_t lastGGA = 0, lastReconnect = 0;
   while (true) {
-    uint8_t rtcmData[512 * 2];
-    uint16_t rtcmCount = 0;
-
-    while (ntrip_c.available()) {
-      rtcmData[rtcmCount++] = ntrip_c.read();
-      if (rtcmCount == sizeof(rtcmData)) break;
+    if (!ntrip_c.connected()) {
+      if (millis() - lastReconnect > RECONNECT_INTERVAL_MS) {
+        lastReconnect = millis();
+        if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
+        else if (requestStream(referenceStations[selectedStationIndex])) lastGGA = 0;   // send GGA right away
+      }
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+      continue;
     }
 
-    Serial2.write(rtcmData, rtcmCount);
+    int n = ntrip_c.available();
+    if (n > 0) {
+      n = ntrip_c.read(rtcmData, min(n, (int)sizeof(rtcmData)));
+      if (n > 0) Serial2.write(rtcmData, n);
+    }
+
+    if (lastGGA == 0 || millis() - lastGGA > GGA_INTERVAL_MS) {
+      char gga[sizeof(latestGGA)];
+      portENTER_CRITICAL(&ggaMux);
+      strcpy(gga, latestGGA);
+      portEXIT_CRITICAL(&ggaMux);
+      if (gga[0]) {
+        ntrip_c.sendGGA(gga);
+        lastGGA = millis();
+      }
+    }
 
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
 
-void gnssDataTask(void *pvParameters) {
-  char* fileName = (char*)pvParameters;
-
-  while (true) {
-    uint8_t GNSSData[1024 * 2];
-    uint16_t dataCount = 0;
-
-    while (Serial2.available()) {
-      GNSSData[dataCount++] = Serial2.read();
-      if (dataCount == sizeof(GNSSData)) break;
+// Remember the latest complete NMEA GGA sentence from the (mixed UBX/NMEA) receiver stream.
+void scanForGGA(const uint8_t* data, int len) {
+  static char line[sizeof(latestGGA)];
+  static int pos = -1;              // -1: not inside a '$' sentence
+  for (int i = 0; i < len; i++) {
+    char c = (char)data[i];
+    if (c == '$') { pos = 0; line[pos++] = c; continue; }
+    if (pos < 0) continue;
+    if (c == '\r' || c == '\n') {
+      line[pos] = '\0';
+      // $GPGGA / $GNGGA with a fix: the quality (7th) field is not empty and not '0'
+      const char* q = line;
+      for (int f = 0; f < 6 && q; f++) { q = strchr(q, ','); if (q) q++; }
+      if (pos > 6 && strncmp(line + 3, "GGA,", 4) == 0 && q && *q && *q != ',' && *q != '0') {
+        portENTER_CRITICAL(&ggaMux);
+        strcpy(latestGGA, line);
+        portEXIT_CRITICAL(&ggaMux);
+      }
+      pos = -1;
+    } else if (pos < (int)sizeof(line) - 1 && c >= 0x20 && c < 0x7f) {
+      line[pos++] = c;
+    } else {
+      pos = -1;                     // binary (UBX) byte or too long: not NMEA
     }
+  }
+}
 
-    if (dataCount > 0) {
-      M5.Lcd.printf("Trying to write %d bytes of GNSS data to file\n", dataCount);
-      M5.Lcd.clear();
-      M5.Lcd.setCursor(0, 0);
-      dataFile = SD.open(fileName, FILE_APPEND);
+// Receiver -> SD card. The file stays open; data is flushed once a second.
+void gnssDataTask(void *pvParameters) {
+  static uint8_t GNSSData[4096];
+  uint32_t lastFlush = millis();
+  while (true) {
+    int n = Serial2.available();
+    if (n > 0) {
+      n = Serial2.readBytes(GNSSData, min(n, (int)sizeof(GNSSData)));
+      scanForGGA(GNSSData, n);
       if (dataFile) {
-        M5.Lcd.printf("Writing %d bytes of GNSS data to file\n", dataCount);
-        dataFile.write(GNSSData, dataCount);
-        dataFile.close();
-        M5.Lcd.clear();
-        M5.Lcd.setCursor(0, 0);
-      } else {
-        M5.Lcd.println("Failed to open data file for writing");
-        M5.Lcd.clear();
-        M5.Lcd.setCursor(0, 0);
+        dataFile.write(GNSSData, n);
+        loggedBytes += n;
       }
     }
-    vTaskDelay(10 / portTICK_PERIOD_MS);
+    if (dataFile && millis() - lastFlush > SD_FLUSH_INTERVAL_MS) {
+      dataFile.flush();
+      lastFlush = millis();
+    }
+    if (n <= 0) vTaskDelay(5 / portTICK_PERIOD_MS);
   }
 }
 
 void setup() {
   M5.begin();
-  WiFiNetwork wifiNetworks[10];
+  WiFiNetwork wifiNetworks[MAX_WIFI];
   int numWiFiNetworks = 0;
-  ReferenceStation referenceStations[10];
   int numStations = 0;
 
   if (!loadConfigFromSD(wifiNetworks, numWiFiNetworks, referenceStations, numStations)) {
     M5.Lcd.println("Failed to load config from SD card");
+    return;
+  }
+  if (numWiFiNetworks == 0 || numStations == 0) {
+    M5.Lcd.println("config.txt needs at least one WIFI: and one STATION: line");
     return;
   }
 
@@ -301,11 +357,11 @@ void setup() {
     }
   }
 
-  M5.Lcd.println("Requesting MountPoint is OK");
   selectedStationIndex = selectReferenceStation(referenceStations, numStations);
   connectToStation(selectedStationIndex, referenceStations);
 
-  Serial2.begin(230400, SERIAL_8N1, 16, 17);
+  Serial2.setRxBufferSize(GNSS_RX_BUFFER);    // must be set before begin()
+  Serial2.begin(GNSS_BAUD, SERIAL_8N1, 16, 17);
 
   M5.Lcd.println("Serial begin.");
   delay(3000);
@@ -319,13 +375,16 @@ void setup() {
   }
   M5.Lcd.println("SD card initialized.");
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-  M5.Lcd.println("Time Adjusted.");
-
   struct tm timeInfo;
-  getLocalTime(&timeInfo);
-  sprintf(fileName, "/data_%04d%02d%02d_%02d%02d%02d.ubx",
-          timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday,
-          timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
+  if (getLocalTime(&timeInfo, 10000)) {        // wait up to 10 s for NTP, otherwise the name says 1970
+    M5.Lcd.println("Time Adjusted.");
+    sprintf(fileName, "/data_%04d%02d%02d_%02d%02d%02d.ubx",
+            timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday,
+            timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
+  } else {
+    M5.Lcd.println("NTP failed, using a random file name");
+    sprintf(fileName, "/data_nontp_%lu.ubx", (unsigned long)esp_random());
+  }
 
   dataFile = SD.open(fileName, FILE_APPEND);
   if (dataFile) {
@@ -337,11 +396,20 @@ void setup() {
   M5.Speaker.tone(100, 100);
   delay(100);
   M5.Speaker.mute();
-  xTaskCreate(ntripClientTask, "NTRIPClient", 4096, NULL, 1, NULL);
-  xTaskCreate(gnssDataTask, "GNSSData", 8192, (void*)fileName, 1, NULL);
+  xTaskCreate(ntripClientTask, "NTRIPClient", 6144, NULL, 1, NULL);
+  xTaskCreate(gnssDataTask, "GNSSData", 6144, NULL, 2, NULL);
 }
 
+// Status screen once a second instead of clearing the LCD on every write.
 void loop()
 {
-
+  static uint32_t last = 0;
+  if (millis() - last < 1000) return;
+  last = millis();
+  M5.Lcd.fillRect(0, 0, 320, 80, BLACK);
+  M5.Lcd.setCursor(0, 0);
+  M5.Lcd.printf("File: %s\n", fileName);
+  M5.Lcd.printf("Logged: %lu bytes\n", (unsigned long)loggedBytes);
+  M5.Lcd.printf("NTRIP: %s\n", ntrip_c.connected() ? "connected" : "reconnecting");
+  M5.Lcd.printf("GGA: %s\n", latestGGA[0] ? "yes" : "none yet");
 }

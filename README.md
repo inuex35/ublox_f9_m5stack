@@ -11,6 +11,8 @@ This code implements an NTRIP client on the M5Stack, designed to work with a u-b
 - Reception of GNSS correction data from NTRIP server / NTRIPサーバーからのGNSS補正データの受信
 - Forwarding of received GNSS correction data to u-blox module / 受信したGNSS補正データのu-bloxモジュールへの転送
 - Saving GNSS data received from u-blox module to SD card / u-bloxモジュールから受信したGNSSデータのSDカードへの保存
+- Sending the receiver's GGA position to the caster every 10 s (needed by VRS / nearest-base mountpoints) / 受信機の GGA を 10 秒ごとにキャスターへ送信 (VRS などで必要)
+- Automatic reconnection when the NTRIP stream or WiFi drops / NTRIP や WiFi が切れたときの自動再接続
 
 ## Required Hardware / 必要なハードウェア
 
@@ -30,6 +32,8 @@ config.txt:
 
 `STATION:NAME,SERVER_ADDRESS,PORT,MOUNTPOINT,USERNAME,PASSWORD`
 
+USERNAME and PASSWORD may be left empty for open casters (`STATION:NAME,SERVER,2101,MOUNT,,`). / 認証のないキャスターではユーザー名とパスワードを空にできます。
+
 Multiple WiFi networks and reference stations can be registered. / 複数のWiFiネットワークと参照局を登録できます。
 
 ## Usage / 使い方
@@ -44,7 +48,7 @@ Multiple WiFi networks and reference stations can be registered. / 複数のWiFi
 
 - This code is designed to work with a u-blox GNSS module on the M5Stack. Operation on other platforms or with other GNSS modules is not guaranteed. / 本コードはM5Stack上でu-bloxのGNSSモジュールと連携するように設計されています。他のプラットフォームや他のGNSSモジュールでの動作は保証されません。
 - Connection to the NTRIP server requires a valid username and password. / NTRIPサーバーへの接続には、適切なユーザー名とパスワードが必要です。
-- Proper serial communication settings are required for communication with the u-blox module. This code uses serial port 2, with a baud rate of 230400bps, 8N1. / u-bloxモジュールとの通信には、適切なシリアル通信設定が必要です。このコードでは、シリアルポート2を使用し、ボーレート230400bps、8N1で通信しています。
+- Proper serial communication settings are required for communication with the u-blox module. This code uses serial port 2, with a baud rate of 230400bps, 8N1. Set the receiver's UART1 to 230400 bps and enable NMEA GGA output (used for the GGA upload). At high UBX rates (e.g. RAWX + ESF) the link is close to full; reduce the message set if data is lost. / u-bloxモジュールとの通信には、適切なシリアル通信設定が必要です。このコードでは、シリアルポート2を使用し、ボーレート230400bps、8N1で通信しています。受信機の UART1 を 230400bps にし、NMEA GGA を出力する設定にしてください (GGA 送信に使います)。RAWX や ESF など UBX を大量に出すと回線がほぼ一杯になるので、データが欠ける場合は出力を減らしてください。
 
 ## License / ライセンス
 
