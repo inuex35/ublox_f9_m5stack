@@ -17,40 +17,63 @@ This code implements an NTRIP client on the M5Stack, designed to work with a u-b
 
 ## Required Hardware / 必要なハードウェア
 
-- M5Stack
-- u-blox GNSS module
+- M5Stack Core2 (M5Stack Basic / Gray also build with M5Unified) / M5Stack Core2 (Basic / Gray も M5Unified でビルド可)
+- u-blox GNSS receiver (tested with ZED-F9R) / u-blox GNSS 受信機 (ZED-F9R で確認)
 - SD card / SDカード
+- Optional: CAN transceiver (e.g. M5Stack CAN Unit) for the vehicle speed from OBD-II / 任意: OBD-II の車速用 CAN トランシーバ (M5Stack CAN Unit など)
+
+## Wiring / 配線
+
+| | M5Stack Core2 | Receiver / car |
+|---|---|---|
+| `GNSS:I2C` (default) | Port A (red), GPIO32 SDA / GPIO33 SCL | Qwiic / I2C (0x42) |
+| `GNSS:UART` | Port C (blue), GPIO13 RX / GPIO14 TX | UART1 TX / RX (swap!) |
+| `CAN:ON` | Port B (black), GPIO36 RX / GPIO26 TX | CAN transceiver -> OBD pin 6 CAN-H, pin 14 CAN-L, pins 4/5 GND |
+
+**Power:** Grove ports carry 5 V on the red wire, Qwiic expects 3.3 V. Do not connect the red wire of a Grove-to-Qwiic cable to a board whose Qwiic 3.3 V goes straight to the receiver; power the receiver from its own USB / 5 V input and connect only GND / SDA / SCL. / Grove の赤線は 5 V、Qwiic は 3.3 V です。Qwiic の 3.3 V が受信機に直結のボードには、Grove-Qwiic ケーブルの赤線をつながず、受信機は自身の USB / 5 V 入力から給電し、GND / SDA / SCL だけをつないでください。
+
+In the car, OBD pin 16 has +12 V at all times; use an automotive 12 V -> 5 V converter to the M5Stack's USB-C. / 車では OBD の 16 番ピンが常時 +12 V です。車載用の 12 V -> 5 V 変換器から M5Stack の USB-C に給電します。
 
 ## Setup / 設定
 
-1. Connect the u-blox GNSS module to the M5Stack's Grove Port A with a Qwiic-to-Grove cable (I2C, address 0x42, 400 kHz). / u-blox GNSSモジュールを Qwiic-Grove ケーブルで M5Stack の Grove ポート A に接続します (I2C、アドレス 0x42、400 kHz)。
-2. Configure the receiver once (over its USB): `python tools/f9r_config.py COMx apply-i2c` enables on I2C the raw GNSS (RXM-RAWX, RXM-SFRBX), sensor (ESF-RAW, ESF-MEAS, ESF-STATUS, ESF-INS), solution (NAV-PVT, NAV-PVAT) and NMEA GGA messages and RTCM3 input, saved to flash. `backup FILE.json` saves the current settings first. Needs `pip install pyubx2 pyserial`. / 受信機を一度だけ設定します (受信機の USB から)。`python tools/f9r_config.py COMx apply-i2c` で、I2C に生データ・センサ・測位解・GGA を出し、RTCM3 を受け付ける設定をフラッシュに保存します。`backup FILE.json` で事前に今の設定を保存できます。
-3. Create a `config.txt` file in the root directory of the SD card. / SDカードのルートディレクトリに `config.txt` ファイルを作成します。
-4. In the `config.txt` file, list the WiFi networks and reference stations in the following format: / `config.txt` ファイルに、WiFiネットワークと参照局の情報を以下の形式で記述します：
+Create `config.txt` in the root of the SD card. / SD カードのルートに `config.txt` を作ります。
 
-config.txt:
+```
+WIFI:SSID,PASSWORD
+STATION:NAME,SERVER_ADDRESS,PORT,MOUNTPOINT,USERNAME,PASSWORD
+GNSS:I2C
+RATE_HZ:2
+CAN:ON
+ENGINE_OFF_S:60
+```
 
-`WIFI:SSID,PASSWORD`
+| Line | Meaning |
+|---|---|
+| `WIFI:` | WiFi networks (up to 10). For NTRIP, NTP (file names) and downloads; logging also works without WiFi. / NTRIP・時刻・ダウンロード用。WiFi なしでも記録します |
+| `STATION:` | NTRIP casters (up to 9). USERNAME / PASSWORD may be empty. A "(no NTRIP, log only)" entry is always added. / ユーザー名・パスワードは空でも可。「NTRIP なし (記録のみ)」が常に追加されます |
+| `GNSS:` | `I2C` (Port A) or `UART` (Port C, 921600 bps; the receiver's baud rate is detected and switched) / 受信機との接続 |
+| `RATE_HZ:` | RAWX / navigation rate, 1–10. Default 5 on UART, 2 on I2C. / 測位レート |
+| `CAN:` | `ON` (Port B) or `CAN:<rx gpio>,<tx gpio>`: read the speed from OBD-II and feed it to the receiver. / OBD-II の車速を受信機に入力 |
+| `ENGINE_OFF_S:` | Seconds without an OBD answer before closing the log and sleeping (default 60). / OBD の応答がないまま何秒で記録を閉じて眠るか |
 
-`STATION:NAME,SERVER_ADDRESS,PORT,MOUNTPOINT,USERNAME,PASSWORD`
+The receiver is configured by the logger at every start (RAM and battery-backed RAM, not flash): measurement rate; RXM-RAWX, RXM-SFRBX, ESF-MEAS, ESF-STATUS, ESF-INS, NAV-PVT, NAV-PVAT and NMEA GGA on the link port only; all output on the other ports off (the receiver's transmit buffer is shared, and an undrained USB port makes it drop messages); ESF-RAW off (ESF-MEAS has the same IMU data and also the speed input); with `CAN:` the speed input (CFG-SFODO). / 受信機は起動のたびにロガーが設定します (RAM とバックアップ RAM、フラッシュには書きません)。
 
-USERNAME and PASSWORD may be left empty for open casters (`STATION:NAME,SERVER,2101,MOUNT,,`). / 認証のないキャスターではユーザー名とパスワードを空にできます。
-
-Multiple WiFi networks and reference stations can be registered. / 複数のWiFiネットワークと参照局を登録できます。
+`tools/f9r_config.py` sets or backs up the receiver over its own USB (`pip install pyubx2 pyserial`). / 受信機の USB から設定・バックアップするスクリプトです。
 
 ## Usage / 使い方
 
-1. Power on the M5Stack. / M5Stackの電源を入れます。
-2. Select and connect to a WiFi network. / WiFiネットワークを選択し、接続します。
-3. Select and connect to a reference station. / 参照局を選択し、接続します。
-4. The received GNSS correction data from the NTRIP server will be forwarded to the u-blox module. / NTRIPサーバーから受信したGNSS補正データが、u-bloxモジュールに転送されます。
-5. The GNSS data received from the u-blox module will be saved to the SD card. The file name will be in the format `data_YYYYMMDD_HHMMSS.ubx`. / u-bloxモジュールから受信したGNSSデータがSDカードに保存されます。ファイル名は `data_YYYYMMDD_HHMMSS.ubx` の形式です。
+1. Power on. The saved WiFi network and station are taken after 10 s unless a button is touched (A up, C down, B select). / 起動します。ボタンに触れなければ、前回の WiFi と基準局が 10 秒で選ばれます (A 上、C 下、B 決定)。
+2. The receiver data is logged to `data_YYYYMMDD_HHMMSS.ubx` (or `log_NNNNN.ubx` without NTP time). / 受信機のデータを記録します (時刻がとれないときは連番のファイル名)。
+3. Download: open `http://<M5Stack IP>/` on a phone or PC on the same WiFi. / 同じ WiFi のスマホや PC で `http://<IP>/` を開いてダウンロード。
+4. Hold B for 2 s to close the file before removing the SD card (hold again for a new file). / SD を抜く前に B を 2 秒長押しでファイルを閉じます (もう一度で新しいファイル)。
+5. With `CAN:`: when the car stops answering OBD requests (engine off) the log is closed and the M5Stack sleeps, checking the car every 30 s; it starts logging again by itself when the engine runs. Touching the screen also wakes it. / エンジンを切ると記録を閉じて眠り、30 秒ごとに車を確認し、エンジンがかかると自動で記録を再開します。画面に触れても起きます。
+6. When the external 5 V disappears (Core2), the file is closed on the internal battery and the M5Stack powers off. / 外部 5 V が切れると、内蔵バッテリーでファイルを閉じてから電源を切ります (Core2)。
 
 ## Notes / 注意事項
 
-- This code is designed to work with a u-blox GNSS module on the M5Stack. Operation on other platforms or with other GNSS modules is not guaranteed. / 本コードはM5Stack上でu-bloxのGNSSモジュールと連携するように設計されています。他のプラットフォームや他のGNSSモジュールでの動作は保証されません。
-- Connection to the NTRIP server requires a valid username and password. / NTRIPサーバーへの接続には、適切なユーザー名とパスワードが必要です。
-- The receiver is read over I2C (Qwiic / Grove Port A). At 400 kHz the link carries roughly 20–30 KB/s; the message set above is about 15 KB/s at the receiver's 2 Hz rate. If the log shows gaps after raising the rate, reduce messages or use UART at 921600 bps instead. / 受信機とは I2C (Qwiic / Grove ポート A) でやり取りします。400 kHz で毎秒 20〜30 KB 程度で、上の設定は 2 Hz で毎秒約 15 KB です。測位レートを上げてデータが欠ける場合は、メッセージを減らすか UART (921600 bps) を使ってください。
+- I2C runs at 100 kHz, about 10 KB/s: the receiver stretches the I2C clock and above 100 kHz the ESP32 misreads it. This is enough for 2 Hz; for 5 Hz RAWX (about 15–17 KB/s outdoors) use `GNSS:UART`. The status screen shows damaged frames. / I2C は 100 kHz (毎秒約 10 KB) です。受信機のクロックストレッチを ESP32 が 100 kHz より速いと読み違えるためです。2 Hz なら足りますが、RAWX 5 Hz (屋外で毎秒 15〜17 KB) には `GNSS:UART` を使ってください。画面に壊れたメッセージの数が出ます。
+- OBD-II speed has 1 km/h steps. / OBD-II の車速は 1 km/h 刻みです。
+- While the M5Stack sleeps the receiver keeps its power (about 0.3–0.5 W together); for long parking, unplug or use a switched supply. / 眠っている間も受信機には電源が来ています (合わせて 0.3〜0.5 W 程度)。長く駐車するときは抜くか、スイッチ付きの電源にしてください。
 
 ## License / ライセンス
 
